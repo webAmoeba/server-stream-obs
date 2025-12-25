@@ -391,7 +391,34 @@ def bring_scene_item_to_top(ws: ObsClient, scene_name: str, source_name: str) ->
         )
     except Exception:
         pass
-def configure_output(ws: ObsClient, cfg: Config) -> None:
+def _format_keyframe_interval(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _gop_to_seconds(gop: int, fps_num: int, fps_den: int) -> Optional[float]:
+    if gop <= 0:
+        return None
+    if gop <= 10:
+        return float(gop)
+    if fps_num > 0 and fps_den > 0:
+        return gop / (fps_num / fps_den)
+    return float(gop)
+
+
+def _set_profile_param(ws: ObsClient, category: str, name: str, value: str) -> bool:
+    try:
+        ws.call(
+            "SetProfileParameter",
+            parameterCategory=category,
+            parameterName=name,
+            parameterValue=value,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def configure_output(ws: ObsClient, cfg: Config, fps_num: int, fps_den: int) -> None:
     v_kbps = parse_kbps(cfg.video_bitrate, 2500)
     a_kbps = parse_kbps(cfg.audio_bitrate, 160)
     preset = cfg.preset or "veryfast"
@@ -414,7 +441,30 @@ def configure_output(ws: ObsClient, cfg: Config) -> None:
             parameterName="Preset",
             parameterValue=preset,
         )
-        log(f"Output settings: preset={preset}, v_bitrate={v_kbps}k, a_bitrate={a_kbps}k")
+        gop_sec = _gop_to_seconds(cfg.gop, fps_num, fps_den)
+        if gop_sec:
+            gop_value = _format_keyframe_interval(gop_sec)
+            ok = False
+            for category, name in (
+                ("AdvOut", "KeyframeInterval"),
+                ("SimpleOutput", "KeyframeInterval"),
+                ("Output", "KeyframeInterval"),
+            ):
+                if _set_profile_param(ws, category, name, gop_value):
+                    ok = True
+                    break
+            if ok:
+                log(
+                    "Output settings: preset=%s, v_bitrate=%sk, a_bitrate=%sk, keyint=%ss (STREAM_GOP=%s)"
+                    % (preset, v_kbps, a_kbps, gop_value, cfg.gop)
+                )
+            else:
+                log(
+                    "Output settings: preset=%s, v_bitrate=%sk, a_bitrate=%sk (keyint not applied; STREAM_GOP=%s)"
+                    % (preset, v_kbps, a_kbps, cfg.gop)
+                )
+        else:
+            log(f"Output settings: preset={preset}, v_bitrate={v_kbps}k, a_bitrate={a_kbps}k")
     except Exception as exc:
         log(f"WARN: failed to set output params: {exc}")
 
@@ -552,7 +602,7 @@ def main() -> int:
         fpsDenominator=fps_out_den,
     )
 
-    configure_output(ws, cfg)
+    configure_output(ws, cfg, fps_out_num, fps_out_den)
     configure_stream(ws, cfg)
     ensure_streaming(ws)
 
