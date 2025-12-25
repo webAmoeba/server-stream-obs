@@ -24,11 +24,6 @@ status:
 logs:
 	journalctl -u server-stream-obs -n 200 --no-pager
 
-reinstall:
-	-systemctl stop server-stream-obs
-	$(MAKE) install
-	systemctl start server-stream-obs
-
 # Torrent helpers
 TORRENT_FILE ?= /root/my.torrent
 DOWNLOAD_DIR ?= /root/downloads

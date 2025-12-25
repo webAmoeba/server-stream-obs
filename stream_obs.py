@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import json
 import os
-from fractions import Fraction
 import re
 import signal
 import subprocess
 import sys
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -433,28 +433,15 @@ def ensure_streaming(ws: ObsClient) -> None:
         ws.call("StartStream")
 
 
-def build_media_settings(cfg: Config, input_path: Path | None) -> dict:
+def build_media_settings(cfg: Config, playlist: list[Path]) -> dict:
     return {
-        "playlist": ([{"value": str(input_path), "hidden": False}] if input_path else []),
+        "playlist": [{"value": str(p), "hidden": False} for p in playlist],
         "loop": False,
         "shuffle": False,
         "audio_track": cfg.audio_index,
         "sub_track": cfg.sub_si,
         "video_track": 1,
     }
-
-
-def update_media_source(ws: ObsClient, cfg: Config, input_path: Path) -> None:
-    settings = build_media_settings(cfg, input_path)
-    ws.call("SetInputSettings", inputName=cfg.obs_media_source, inputSettings=settings, overlay=False)
-    try:
-        ws.call(
-            "TriggerMediaInputAction",
-            inputName=cfg.obs_media_source,
-            mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART",
-        )
-    except Exception:
-        pass
 
 
 def update_text(ws: ObsClient, cfg: Config, title: str) -> None:
@@ -527,7 +514,7 @@ def main() -> int:
     ensure_scene(ws, cfg.obs_scene)
 
     media_kind = ensure_mpv_source(ws)
-    media_settings = build_media_settings(cfg, None)
+    media_settings = build_media_settings(cfg, [])
     ensure_input(ws, cfg.obs_scene, cfg.obs_media_source, media_kind, media_settings)
 
     text_kind = pick_text_input_kind(ws)
@@ -574,43 +561,73 @@ def main() -> int:
         log(f"WARN: START_EP not found: {cfg.start_ep}")
         start_idx = 0
 
-    first_pass = True
+    order = files
+    if start_idx:
+        order = files[start_idx:] + files[:start_idx]
+
+    # Load full playlist once (mpv will advance automatically)
+    ws.call(
+        "SetInputSettings",
+        inputName=cfg.obs_media_source,
+        inputSettings=build_media_settings(cfg, order),
+        overlay=False,
+    )
+
+    current_idx = 0
+    current_title = title_for_path(order[current_idx])
+    cache = [None]
+    prev_cursor = None
+
+    if text_enabled:
+        maybe_update_text(ws, cfg, current_title, 0, 0, cache)
+
     try:
-        while True:
-            if first_pass and start_idx:
-                order = files[start_idx:] + files[:start_idx]
-            else:
-                order = files
+        while not stop:
+            resp = ws.call("GetMediaInputStatus", inputName=cfg.obs_media_source)
+            state = resp.get("mediaState", "")
+            cursor = resp.get("mediaCursor")
+            duration = resp.get("mediaDuration")
 
-            for idx, f in enumerate(order, start=1):
-                if stop:
-                    return 0
-                log(f"Playing {idx}/{len(order)}: {f}")
-                title = title_for_path(f)
-                cache = [None]
+            if text_enabled:
+                maybe_update_text(ws, cfg, current_title, cursor, duration, cache)
+
+            if state == "OBS_MEDIA_STATE_ERROR":
+                return 2
+
+            # Detect file switch by cursor reset
+            if prev_cursor is not None and cursor is not None and cursor + 2000 < prev_cursor:
+                current_idx += 1
+                if current_idx >= len(order):
+                    if cfg.loop:
+                        current_idx = 0
+                        try:
+                            ws.call(
+                                "TriggerMediaInputAction",
+                                inputName=cfg.obs_media_source,
+                                mediaAction="OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART",
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        break
+                current_title = title_for_path(order[current_idx])
+                cache[0] = None
                 if text_enabled:
-                    maybe_update_text(ws, cfg, title, 0, 0, cache)
-                update_media_source(ws, cfg, f)
-                code = wait_for_media_end(
-                    ws,
-                    cfg.obs_media_source,
-                    lambda: stop,
-                    on_tick=lambda status: maybe_update_text(
-                        ws,
-                        cfg,
-                        title,
-                        status.get("mediaCursor"),
-                        status.get("mediaDuration"),
-                        cache,
-                    ),
-                )
-                if code != 0:
-                    return code
+                    maybe_update_text(ws, cfg, current_title, 0, 0, cache)
 
-            if not cfg.loop:
+            if state in {"OBS_MEDIA_STATE_ENDED", "OBS_MEDIA_STATE_STOPPED"} and not cfg.loop and current_idx >= len(order) - 1:
                 break
-            first_pass = False
+
+            if cursor is not None:
+                prev_cursor = cursor
+            time.sleep(1)
     finally:
+        try:
+            if ws.call("GetStreamStatus").get("outputActive", False):
+                ws.call("StopStream")
+        except Exception:
+            pass
+
         try:
             if ws.call("GetStreamStatus").get("outputActive", False):
                 ws.call("StopStream")
